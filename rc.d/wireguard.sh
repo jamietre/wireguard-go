@@ -21,7 +21,7 @@ start() {
     # tun is normally pre-loaded on RT6600AX; load it if missing
     lsmod | grep -q '^tun ' || insmod /lib/modules/tun.ko
 
-    WG_PROCESS_FOREGROUND=1 $WG_BIN $INTERFACE >> $LOG 2>&1 &
+    WG_PROCESS_FOREGROUND=1 WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1 $WG_BIN $INTERFACE >> $LOG 2>&1 &
 
     # wait for wireguard-go to create the interface socket
     for i in $(seq 1 10); do
@@ -43,6 +43,11 @@ start() {
 
     ip link set up dev $INTERFACE
 
+    # SRM's INPUT_FIREWALL chain drops unknown inbound traffic; add an
+    # explicit accept rule so handshake packets reach wireguard-go.
+    PORT=$(grep 'ListenPort' $CONFIG | awk '{print $3}')
+    iptables -I INPUT_FIREWALL -p udp --dport $PORT -j ACCEPT
+
     echo "WireGuard $INTERFACE started" | tee -a $LOG
 }
 
@@ -51,6 +56,8 @@ stop() {
         echo "WireGuard $INTERFACE is not running"
         exit 0
     fi
+    PORT=$(grep 'ListenPort' $CONFIG | awk '{print $3}')
+    iptables -D INPUT_FIREWALL -p udp --dport $PORT -j ACCEPT 2>/dev/null
     ip link delete $INTERFACE
     echo "WireGuard $INTERFACE stopped" | tee -a $LOG
 }
