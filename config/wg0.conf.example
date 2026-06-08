@@ -4,7 +4,7 @@
 
 [Interface]
 PrivateKey = aIB/5HUwCnE5UgAfiO6nA2RlLWv/oKtKJZuMXmC+1lE=
-ListenPort = 51820
+ListenPort = 51822
 
 [Peer]
 # Android phone
