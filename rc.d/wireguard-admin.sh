@@ -6,17 +6,13 @@
 #   -endpoint <WAN-IP-or-hostname>:51822   (public endpoint for client configs)
 #
 # Optional:
-#   -srm-verify-url <url>   check SRM session (e.g. http://127.0.0.1:8000/webapi/...)
-#                           When set, users already logged in to SRM are admitted
-#                           automatically. Falls back to local login form if unset
-#                           or if SRM check fails.
+#   -srm-sessions <path>    SRM active session file. When set, users already
+#                           logged in to SRM are admitted automatically.
+#                           Falls back to local login form (/etc/shadow) otherwise.
 #
-# To set a local "admin" password (used when SRM session check is not available):
-#   /volume1/wireguard/bin/wg-admin setpassword
-#
-# SRM session cookie name: "id" (confirmed on RT6600AX, SRM 1.x).
-# SRM listens on port 8000 (HTTP). Invalid sessions return {"success":false};
-# valid sessions return {"success":true}. Port/path confirmed via API discovery.
+# Session file confirmed on RT6600AX: /usr/syno/etc/private/session/current.users
+# Each line is a JSON object with "id" (cookie) and "name" (username).
+# Reading directly avoids the IP-binding issue with SRM's API-based auth.
 
 INSTALL_DIR=/volume1/wireguard
 BINARY=$INSTALL_DIR/bin/wg-admin
@@ -25,7 +21,7 @@ PIDFILE=/var/run/wireguard-admin.pid
 
 # ── Edit these to match your deployment ──────────────────────────────────────
 ENDPOINT="71.181.45.226:51822"
-SRM_VERIFY_URL="http://127.0.0.1:8000/webapi/entry.cgi?api=SYNO.Core.User&method=get&version=1"
+SRM_SESSIONS="/usr/syno/etc/private/session/current.users"
 ADDR="0.0.0.0:8080"
 DNS="172.16.2.1"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +41,7 @@ start() {
     fi
 
     ARGS="-endpoint $ENDPOINT -addr $ADDR -dns $DNS"
-    [ -n "$SRM_VERIFY_URL" ] && ARGS="$ARGS -srm-verify-url $SRM_VERIFY_URL"
+    [ -n "$SRM_SESSIONS" ] && ARGS="$ARGS -srm-sessions $SRM_SESSIONS"
 
     $BINARY $ARGS >> $LOG 2>&1 &
     echo $! > "$PIDFILE"

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,13 +22,13 @@ import (
 )
 
 var (
-	flagDir      = flag.String("dir", "/volume1/wireguard", "wireguard config directory")
-	flagAddr     = flag.String("addr", "0.0.0.0:8080", "listen address")
-	flagEndpoint = flag.String("endpoint", "", "public endpoint for client configs (host:port)")
-	flagIface    = flag.String("iface", "wg0", "wireguard interface")
-	flagDNS      = flag.String("dns", "172.16.2.1", "DNS server for client configs")
-	flagSRMURL   = flag.String("srm-verify-url", "", "SRM API URL to check session validity (empty=disabled)")
-	flagQREncode = flag.String("qrencode", "/usr/syno/bin/qrencode", "path to qrencode binary")
+	flagDir         = flag.String("dir", "/volume1/wireguard", "wireguard config directory")
+	flagAddr        = flag.String("addr", "0.0.0.0:8080", "listen address")
+	flagEndpoint    = flag.String("endpoint", "", "public endpoint for client configs (host:port)")
+	flagIface       = flag.String("iface", "wg0", "wireguard interface")
+	flagDNS         = flag.String("dns", "172.16.2.1", "DNS server for client configs")
+	flagSRMSessions = flag.String("srm-sessions", "/usr/syno/etc/private/session/current.users", "SRM active sessions file (empty=disabled)")
+	flagQREncode    = flag.String("qrencode", "/usr/syno/bin/qrencode", "path to qrencode binary")
 )
 
 type Peer struct {
@@ -48,11 +49,10 @@ type App struct {
 	dns          string
 	wgBin        string
 	qrBin        string
-	srmVerifyURL string
+	srmSessions  string // path to SRM current.users session file
 	passFile     string
 	sessionKey   []byte
 	mu           sync.Mutex
-	srmClient    *http.Client
 	tmpl         *template.Template
 	loginTmpl    *template.Template
 	qrTmpl       *template.Template
@@ -67,15 +67,14 @@ func main() {
 	}
 
 	app := &App{
-		dir:          *flagDir,
-		endpoint:     *flagEndpoint,
-		iface:        *flagIface,
-		dns:          *flagDNS,
-		wgBin:        filepath.Join(*flagDir, "bin", "wg"),
-		qrBin:        *flagQREncode,
-		srmVerifyURL: *flagSRMURL,
-		passFile:     filepath.Join(*flagDir, ".admin_password"),
-		srmClient:    &http.Client{Timeout: 2 * time.Second},
+		dir:         *flagDir,
+		endpoint:    *flagEndpoint,
+		iface:       *flagIface,
+		dns:         *flagDNS,
+		wgBin:       filepath.Join(*flagDir, "bin", "wg"),
+		qrBin:       *flagQREncode,
+		srmSessions: *flagSRMSessions,
+		passFile:    filepath.Join(*flagDir, ".admin_password"),
 	}
 
 	app.sessionKey = make([]byte, 32)
@@ -91,11 +90,12 @@ func main() {
 	app.importExistingPeers()
 	app.mu.Unlock()
 
-	if app.srmVerifyURL == "" && !app.shadowEnabled() {
-		log.Fatal("no auth configured: set -srm-verify-url and/or run 'wg-admin setpassword'")
+	if app.srmSessions == "" && !app.shadowEnabled() {
+		log.Fatal("no auth configured: ensure /etc/shadow is readable or run 'wg-admin setpassword'")
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/auth", app.handleDebugAuth)
 	mux.HandleFunc("/login", app.handleLogin)
 	mux.HandleFunc("/logout", app.handleLogout)
 	mux.HandleFunc("/peers/qr", app.require(app.handleQR))
@@ -111,13 +111,15 @@ func main() {
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 func (app *App) shadowEnabled() bool {
-	_, err := os.Stat(app.passFile)
+	// Shadow auth is available whenever /etc/shadow is readable (i.e. running as root).
+	// The pass file (setpassword) is an optional additional credential source.
+	_, err := os.Stat("/etc/shadow")
 	return err == nil
 }
 
-// checkAuth tries SRM session proxy first, then a local signed session cookie.
+// checkAuth tries SRM session file first, then a local signed session cookie.
 func (app *App) checkAuth(r *http.Request) bool {
-	if app.srmVerifyURL != "" && app.verifySRM(r) {
+	if app.srmSessions != "" && app.verifySRM(r) {
 		return true
 	}
 	c, err := r.Cookie("wg_session")
@@ -128,29 +130,34 @@ func (app *App) checkAuth(r *http.Request) bool {
 	return ok
 }
 
+// verifySRM reads the SRM session file and checks whether the request's "id"
+// cookie corresponds to an active session. This avoids the IP-binding issue
+// that breaks API-based session verification.
 func (app *App) verifySRM(r *http.Request) bool {
-	req, err := http.NewRequest("GET", app.srmVerifyURL, nil)
+	cookie, err := r.Cookie("id")
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	f, err := os.Open(app.srmSessions)
 	if err != nil {
 		return false
 	}
-	// Forward all cookies so SRM can identify the session.
-	for _, c := range r.Cookies() {
-		req.AddCookie(c)
+	defer f.Close()
+
+	var entry struct {
+		Name string `json:"name"`
+		ID   string `json:"id"`
 	}
-	resp, err := app.srmClient.Do(req)
-	if err != nil {
-		log.Printf("SRM session check failed: %v", err)
-		return false
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if entry.ID == cookie.Value && entry.Name != "" {
+			return true
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var result struct {
-		Success bool `json:"success"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Success
+	return false
 }
 
 func (app *App) require(next http.HandlerFunc) http.HandlerFunc {
@@ -219,8 +226,12 @@ func (app *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodGet {
+		if app.checkAuth(r) {
+			http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusSeeOther)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		app.loginTmpl.Execute(w, loginData{Next: r.URL.Query().Get("next")})
 		return
 	}
@@ -444,6 +455,25 @@ Endpoint = %s
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 `, p.PrivateKey, p.Address, app.dns, app.serverPublicKey(), app.endpoint)
+}
+
+func (app *App) handleDebugAuth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintln(w, "=== Cookies received ===")
+	for _, c := range r.Cookies() {
+		fmt.Fprintf(w, "  %s = %s...\n", c.Name, c.Value[:min(len(c.Value), 8)])
+	}
+	fmt.Fprintln(w, "\n=== SRM session file check ===")
+	fmt.Fprintf(w, "  file: %s\n", app.srmSessions)
+	fmt.Fprintf(w, "  result: %v\n", app.verifySRM(r))
+	fmt.Fprintf(w, "\n=== Overall auth ===\n  %v\n", app.checkAuth(r))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func safeNext(next string) string {
