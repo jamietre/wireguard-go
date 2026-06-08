@@ -12,10 +12,10 @@ echo "Deploying to $USER@$HOST:$REMOTE_DIR"
 
 ssh "$USER@$HOST" "sudo mkdir -p $REMOTE_DIR/bin $REMOTE_DIR/rc.d"
 
-scp bin/wireguard-go  "$USER@$HOST:/tmp/wireguard-go"
-scp bin/wg            "$USER@$HOST:/tmp/wg"
-scp rc.d/wireguard.sh "$USER@$HOST:/tmp/wireguard-rc.sh"
-scp restore.sh        "$USER@$HOST:/tmp/restore.sh"
+ssh "$USER@$HOST" "cat > /tmp/wireguard-go"   < bin/wireguard-go
+ssh "$USER@$HOST" "cat > /tmp/wg"            < bin/wg
+ssh "$USER@$HOST" "cat > /tmp/wireguard-rc.sh" < rc.d/wireguard.sh
+ssh "$USER@$HOST" "cat > /tmp/restore.sh"    < restore.sh
 
 ssh "$USER@$HOST" "
   sudo mv /tmp/wireguard-go  $REMOTE_DIR/bin/wireguard-go
