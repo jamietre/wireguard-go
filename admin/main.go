@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,7 +26,7 @@ var (
 	flagAddr        = flag.String("addr", "0.0.0.0:8080", "listen address")
 	flagEndpoint    = flag.String("endpoint", "", "public endpoint for client configs (host:port)")
 	flagIface       = flag.String("iface", "wg0", "wireguard interface")
-	flagDNS         = flag.String("dns", "172.16.2.1", "DNS server for client configs")
+	flagDNS         = flag.String("dns", "", "default DNS for client configs")
 	flagSRMSessions = flag.String("srm-sessions", "/usr/syno/etc/private/session/current.users", "SRM active sessions file (empty=disabled)")
 	flagQREncode    = flag.String("qrencode", "/usr/syno/bin/qrencode", "path to qrencode binary")
 )
@@ -36,6 +36,8 @@ type Peer struct {
 	Address    string `json:"address"`
 	PrivateKey string `json:"private_key"`
 	PublicKey  string `json:"public_key"`
+	AllowedIPs string `json:"allowed_ips,omitempty"` // client-side; empty = 0.0.0.0/0, ::/0
+	DNS        string `json:"dns,omitempty"`          // client-side; empty = server default
 }
 
 type PeersDB struct {
@@ -43,19 +45,19 @@ type PeersDB struct {
 }
 
 type App struct {
-	dir          string
-	endpoint     string
-	iface        string
-	dns          string
-	wgBin        string
-	qrBin        string
-	srmSessions  string // path to SRM current.users session file
-	passFile     string
-	sessionKey   []byte
-	mu           sync.Mutex
-	tmpl         *template.Template
-	loginTmpl    *template.Template
-	qrTmpl       *template.Template
+	dir         string
+	endpoint    string
+	iface       string
+	dns         string
+	wgBin       string
+	qrBin       string
+	srmSessions string
+	passFile    string
+	sessionKey  []byte
+	mu          sync.Mutex
+	tmpl        *template.Template
+	loginTmpl   *template.Template
+	qrTmpl      *template.Template
 }
 
 func main() {
@@ -100,6 +102,7 @@ func main() {
 	mux.HandleFunc("/peers/qr", app.require(app.handleQR))
 	mux.HandleFunc("/peers/config", app.require(app.handleConfigDownload))
 	mux.HandleFunc("/peers/add", app.require(app.handleAdd))
+	mux.HandleFunc("/peers/edit", app.require(app.handleEdit))
 	mux.HandleFunc("/peers/delete", app.require(app.handleDelete))
 	mux.HandleFunc("/", app.require(app.handleIndex))
 
@@ -110,13 +113,10 @@ func main() {
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 func (app *App) shadowEnabled() bool {
-	// Shadow auth is available whenever /etc/shadow is readable (i.e. running as root).
-	// The pass file (setpassword) is an optional additional credential source.
 	_, err := os.Stat("/etc/shadow")
 	return err == nil
 }
 
-// checkAuth tries SRM session file first, then a local signed session cookie.
 func (app *App) checkAuth(r *http.Request) bool {
 	if app.srmSessions != "" && app.verifySRM(r) {
 		return true
@@ -129,9 +129,6 @@ func (app *App) checkAuth(r *http.Request) bool {
 	return ok
 }
 
-// verifySRM reads the SRM session file and checks whether the request's "id"
-// cookie corresponds to an active session. This avoids the IP-binding issue
-// that breaks API-based session verification.
 func (app *App) verifySRM(r *http.Request) bool {
 	cookie, err := r.Cookie("id")
 	if err != nil || cookie.Value == "" {
@@ -241,8 +238,6 @@ func (app *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	user := strings.TrimSpace(r.FormValue("username"))
 	pass := r.FormValue("password")
 	next := safeNext(r.FormValue("next"))
-	// SRM shadow auth for any user, or the app's own pass file as a fallback.
-	// Pass file is username-agnostic so it works even if SRM's admin is locked.
 	if !verifyShadow(user, pass) && !app.verifyPassFile(pass) {
 		app.loginTmpl.Execute(w, loginData{Error: "Invalid username or password.", Next: next})
 		return
@@ -259,23 +254,35 @@ func (app *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) handleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:   "wg_session",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
-	})
+	http.SetCookie(w, &http.Cookie{Name: "wg_session", Value: "", Path: "/", MaxAge: -1})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
-}
-
-type indexData struct {
-	Peers []peerRow
 }
 
 type peerRow struct {
 	Peer
 	LastHandshake string
+	Status        string // "connected" | "idle" | "never"
 	HasKey        bool
+	Custom        bool // non-default AllowedIPs or DNS
+}
+
+type indexData struct {
+	Peers      []peerRow
+	DefaultDNS string
+}
+
+func peerStatus(hs string) string {
+	if hs == "" || hs == "never" {
+		return "never"
+	}
+	d, err := time.ParseDuration(strings.TrimSuffix(hs, " ago"))
+	if err != nil {
+		return "idle"
+	}
+	if d < 3*time.Minute {
+		return "connected"
+	}
+	return "idle"
 }
 
 func (app *App) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -293,14 +300,17 @@ func (app *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 	hs := app.getHandshakes()
 	var rows []peerRow
 	for _, p := range db.Peers {
+		ago := hs[p.PublicKey]
 		rows = append(rows, peerRow{
 			Peer:          p,
-			LastHandshake: hs[p.PublicKey],
+			LastHandshake: ago,
+			Status:        peerStatus(ago),
 			HasKey:        p.PrivateKey != "",
+			Custom:        p.AllowedIPs != "" || p.DNS != "",
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	app.tmpl.Execute(w, indexData{Peers: rows})
+	app.tmpl.Execute(w, indexData{Peers: rows, DefaultDNS: app.dns})
 }
 
 func (app *App) handleAdd(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +323,9 @@ func (app *App) handleAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name required", http.StatusBadRequest)
 		return
 	}
+	allowedIPs := strings.TrimSpace(r.FormValue("allowed_ips"))
+	dns := strings.TrimSpace(r.FormValue("dns"))
+
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
@@ -331,7 +344,14 @@ func (app *App) handleAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	peer := Peer{Name: name, Address: addr, PrivateKey: privKey, PublicKey: pubKey}
+	peer := Peer{
+		Name:       name,
+		Address:    addr,
+		PrivateKey: privKey,
+		PublicKey:  pubKey,
+		AllowedIPs: allowedIPs,
+		DNS:        dns,
+	}
 	db.Peers = append(db.Peers, peer)
 	if err := app.savePeers(db); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -342,6 +362,43 @@ func (app *App) handleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	app.applyPeerAdd(peer)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (app *App) handleEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pubKey := r.FormValue("key")
+	allowedIPs := strings.TrimSpace(r.FormValue("allowed_ips"))
+	dns := strings.TrimSpace(r.FormValue("dns"))
+
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	db, err := app.loadPeers()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var found bool
+	for i, p := range db.Peers {
+		if p.PublicKey == pubKey {
+			db.Peers[i].AllowedIPs = allowedIPs
+			db.Peers[i].DNS = dns
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.Error(w, "peer not found", http.StatusNotFound)
+		return
+	}
+	if err := app.savePeers(db); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -443,17 +500,27 @@ func (app *App) findPeer(pubKey string) *Peer {
 }
 
 func (app *App) clientConfig(p *Peer) string {
-	return fmt.Sprintf(`[Interface]
-PrivateKey = %s
-Address = %s/32
-DNS = %s
-
-[Peer]
-PublicKey = %s
-Endpoint = %s
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-`, p.PrivateKey, p.Address, app.dns, app.serverPublicKey(), app.endpoint)
+	allowedIPs := p.AllowedIPs
+	if allowedIPs == "" {
+		allowedIPs = "0.0.0.0/0, ::/0"
+	}
+	dns := p.DNS
+	if dns == "" {
+		dns = app.dns
+	}
+	var buf strings.Builder
+	buf.WriteString("[Interface]\n")
+	fmt.Fprintf(&buf, "PrivateKey = %s\n", p.PrivateKey)
+	fmt.Fprintf(&buf, "Address = %s/32\n", p.Address)
+	if dns != "" {
+		fmt.Fprintf(&buf, "DNS = %s\n", dns)
+	}
+	buf.WriteString("\n[Peer]\n")
+	fmt.Fprintf(&buf, "PublicKey = %s\n", app.serverPublicKey())
+	fmt.Fprintf(&buf, "Endpoint = %s\n", app.endpoint)
+	fmt.Fprintf(&buf, "AllowedIPs = %s\n", allowedIPs)
+	buf.WriteString("PersistentKeepalive = 25\n")
+	return buf.String()
 }
 
 func safeNext(next string) string {
@@ -465,124 +532,295 @@ func safeNext(next string) string {
 
 // ── Templates ─────────────────────────────────────────────────────────────────
 
+const sharedCSS = `
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#06090e;
+  --card:#0c1420;
+  --border:#162030;
+  --text:#8fafc4;
+  --bright:#c2d8e8;
+  --dim:#364f62;
+  --accent:#22d3ee;
+  --green:#4ade80;
+  --yellow:#fbbf24;
+  --red:#f87171;
+  --mono:'IBM Plex Mono',monospace;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;line-height:1.5;min-height:100vh}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+input{background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--bright);font-family:var(--mono);font-size:12px;padding:7px 10px;outline:none;transition:border-color .15s;width:100%}
+input:focus{border-color:var(--accent)}
+input::placeholder{color:var(--dim)}
+.btn{display:inline-flex;align-items:center;padding:5px 10px;border:1px solid var(--border);border-radius:3px;background:transparent;color:var(--text);font-family:var(--mono);font-size:11px;cursor:pointer;transition:border-color .15s,color .15s,background .15s;white-space:nowrap;text-decoration:none;letter-spacing:.02em}
+.btn:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
+.btn-accent{border-color:var(--accent);color:var(--accent)}
+.btn-accent:hover{background:rgba(34,211,238,.08)}
+.btn-danger{color:var(--red)}
+.btn-danger:hover{border-color:var(--red);background:rgba(248,113,113,.06);color:var(--red)}
+`
+
 const loginHTML = `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WireGuard Admin</title>
+<title>wg-admin</title>
 <style>
-body{font-family:sans-serif;max-width:360px;margin:80px auto;padding:0 20px;color:#222}
-h1{font-size:20px;margin-bottom:24px}
-label{display:block;margin-bottom:4px;font-size:14px}
-input{width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;margin-bottom:14px;font-size:14px;box-sizing:border-box}
-button{width:100%;padding:9px;background:#333;color:#fff;border:none;border-radius:4px;font-size:14px;cursor:pointer}
-button:hover{background:#555}
-.err{color:#c00;margin-bottom:14px;font-size:14px}
+` + sharedCSS + `
+body{display:flex;flex-direction:column;align-items:center;justify-content:center}
+.card{width:320px;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:32px}
+.logo{color:var(--accent);font-size:15px;font-weight:500;letter-spacing:.08em;margin-bottom:6px}
+.logo-sub{color:var(--dim);font-size:11px;margin-bottom:28px}
+.err{color:var(--red);font-size:11px;margin-bottom:16px;padding:8px 10px;border:1px solid rgba(248,113,113,.3);border-radius:3px;background:rgba(248,113,113,.05)}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+.submit{width:100%;margin-top:4px;padding:8px;border:1px solid var(--accent);border-radius:3px;background:rgba(34,211,238,.08);color:var(--accent);font-family:var(--mono);font-size:12px;cursor:pointer;letter-spacing:.05em;transition:background .15s}
+.submit:hover{background:rgba(34,211,238,.15)}
 </style>
 </head>
 <body>
-<h1>WireGuard Admin</h1>
-{{if .Error}}<p class="err">{{.Error}}</p>{{end}}
-<form method="post" action="/login">
-<input type="hidden" name="next" value="{{.Next}}">
-<label>Username</label>
-<input type="text" name="username" autocomplete="username" required autofocus>
-<label>Password</label>
-<input type="password" name="password" autocomplete="current-password" required>
-<button type="submit">Sign in</button>
-</form>
+<div class="card">
+  <div class="logo">▣ wg-admin</div>
+  <div class="logo-sub">WireGuard peer management</div>
+  {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
+  <form method="post" action="/login">
+    <input type="hidden" name="next" value="{{.Next}}">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button class="submit" type="submit">sign in →</button>
+  </form>
+</div>
 </body>
 </html>`
 
 const indexHTML = `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WireGuard Peers</title>
+<title>wg-admin</title>
 <style>
-*{box-sizing:border-box}
-body{font-family:sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#222}
-h1{margin-bottom:24px}
+` + sharedCSS + `
+header{background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+.hdr{max-width:960px;margin:0 auto;padding:0 24px;height:50px;display:flex;align-items:center;gap:16px}
+.hdr-logo{color:var(--accent);font-size:14px;font-weight:500;letter-spacing:.06em}
+.hdr-iface{color:var(--dim);font-size:11px;padding:2px 7px;border:1px solid var(--border);border-radius:2px}
+.hdr-gap{flex:1}
+.hdr-out{color:var(--dim);font-size:11px}
+.hdr-out:hover{color:var(--text)}
+main{max-width:960px;margin:0 auto;padding:36px 24px}
+.section-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.section-label{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--dim)}
 table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #e5e5e5}
-th{background:#f7f7f7;font-weight:600}
-tr:hover td{background:#fafafa}
-.btn{display:inline-block;padding:5px 11px;border:1px solid #ccc;border-radius:4px;background:#fff;font-size:13px;text-decoration:none;color:#222;cursor:pointer;line-height:1.4}
-.btn:hover{background:#f0f0f0}
-.btn-red{border-color:#e88;color:#c00}
-.btn-red:hover{background:#fff0f0}
-.actions{display:flex;gap:6px;flex-wrap:wrap}
-.add{margin-top:24px;display:flex;gap:8px;align-items:center}
-.add input{padding:7px 10px;border:1px solid #ccc;border-radius:4px;font-size:14px;width:220px}
-.dim{color:#999;font-size:13px}
+thead th{text-align:left;padding:0 12px 10px;font-size:10px;font-weight:400;color:var(--dim);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:hover{background:rgba(12,20,32,.8)}
+td{padding:13px 12px;vertical-align:middle}
+td.td-name{color:var(--bright);font-weight:500;font-size:13px}
+td.td-addr{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+td.td-hs{color:var(--dim);font-size:11px;white-space:nowrap}
+td.td-act{white-space:nowrap}
+.act-row{display:flex;gap:5px;align-items:center}
+.status{display:inline-flex;align-items:center;gap:7px}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.dot-on{background:var(--green);box-shadow:0 0 5px var(--green);animation:glow 2s ease-in-out infinite}
+.dot-idle{background:var(--yellow)}
+.dot-off{background:var(--dim)}
+@keyframes glow{0%,100%{opacity:1;box-shadow:0 0 5px var(--green)}50%{opacity:.5;box-shadow:0 0 2px var(--green)}}
+.badge{font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:2px;padding:1px 5px;letter-spacing:.04em}
+.empty-cell{text-align:center;padding:48px 12px;color:var(--dim);font-size:12px}
+.add-wrap{margin-top:28px;border:1px solid var(--border);border-radius:4px}
+details summary{padding:12px 16px;cursor:pointer;color:var(--dim);font-size:11px;list-style:none;display:flex;align-items:center;gap:8px;user-select:none;transition:color .15s}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:'›';font-size:14px;transition:transform .2s;display:inline-block}
+details[open] summary::before{transform:rotate(90deg)}
+details[open] summary{color:var(--text);border-bottom:1px solid var(--border)}
+.add-form{padding:18px 16px;display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}
+.add-name{display:flex;flex-direction:column;gap:6px}
+.add-name label{font-size:10px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
+.add-advanced{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px}
+.field-stack{display:flex;flex-direction:column;gap:6px}
+.field-stack label{font-size:10px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
+.field-hint{font-size:10px;color:var(--dim);margin-top:3px}
+dialog{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:0;width:440px;max-width:calc(100vw - 40px);color:var(--text);font-family:var(--mono)}
+dialog::backdrop{background:rgba(0,0,0,.75);backdrop-filter:blur(2px)}
+.dlg-head{padding:20px 24px 16px;border-bottom:1px solid var(--border)}
+.dlg-title{color:var(--bright);font-size:13px;font-weight:500}
+.dlg-sub{color:var(--dim);font-size:11px;margin-top:4px}
+.dlg-body{padding:20px 24px}
+.dlg-field{margin-bottom:14px}
+.dlg-field label{display:block;font-size:10px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+.dlg-hint{font-size:10px;color:var(--dim);margin-top:4px}
+.dlg-foot{padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
 </style>
 </head>
 <body>
-<h1>WireGuard Peers</h1>
-<table>
-<thead><tr><th>Name</th><th>VPN IP</th><th>Last Handshake</th><th>Actions</th></tr></thead>
-<tbody>
-{{range .Peers}}
-<tr>
-  <td>{{.Name}}</td>
-  <td>{{.Address}}</td>
-  <td>{{if .LastHandshake}}{{.LastHandshake}}{{else}}<span class="dim">never</span>{{end}}</td>
-  <td class="actions">
-    {{if .HasKey}}
-    <a class="btn" href="/peers/qr?key={{.PublicKey}}">QR Code</a>
-    <a class="btn" href="/peers/config?key={{.PublicKey}}" download>Config</a>
+<header>
+  <div class="hdr">
+    <span class="hdr-logo">▣ wg-admin</span>
+    <span class="hdr-iface">wg0</span>
+    <span class="hdr-gap"></span>
+    <a class="hdr-out" href="/logout">sign out</a>
+  </div>
+</header>
+<main>
+  <div class="section-hdr">
+    <span class="section-label">peers</span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>name</th>
+        <th>address</th>
+        <th>last handshake</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {{range .Peers}}
+    <tr>
+      <td class="td-name">
+        <span class="status">
+          {{if eq .Status "connected"}}<span class="dot dot-on"></span>
+          {{else if eq .Status "idle"}}<span class="dot dot-idle"></span>
+          {{else}}<span class="dot dot-off"></span>{{end}}
+          {{.Name}}
+        </span>
+        {{if .Custom}}<span class="badge">custom</span>{{end}}
+      </td>
+      <td class="td-addr">{{.Address}}</td>
+      <td class="td-hs">{{if .LastHandshake}}{{.LastHandshake}}{{else}}—{{end}}</td>
+      <td class="td-act">
+        <div class="act-row">
+        {{if .HasKey}}
+          <a class="btn" href="/peers/qr?key={{.PublicKey}}">qr</a>
+          <a class="btn" href="/peers/config?key={{.PublicKey}}" download>↓ conf</a>
+          <button class="btn" onclick="document.getElementById('edit-{{.PublicKey}}').showModal()">edit</button>
+        {{else}}
+          <span style="color:var(--dim);font-size:11px">imported</span>
+        {{end}}
+          <form style="display:inline" method="post" action="/peers/delete">
+            <input type="hidden" name="key" value="{{.PublicKey}}">
+            <button class="btn btn-danger" onclick="return confirm('Delete {{.Name}}?')">del</button>
+          </form>
+        </div>
+      </td>
+    </tr>
     {{else}}
-    <span class="dim">no private key (imported)</span>
+    <tr><td colspan="4" class="empty-cell">no peers configured — add one below</td></tr>
     {{end}}
-    <form style="display:inline" method="post" action="/peers/delete">
-      <input type="hidden" name="key" value="{{.PublicKey}}">
-      <button class="btn btn-red" onclick="return confirm('Delete {{.Name}}?')">Delete</button>
-    </form>
-  </td>
-</tr>
-{{else}}
-<tr><td colspan="4" style="text-align:center;color:#999;padding:32px">No peers yet</td></tr>
-{{end}}
-</tbody>
-</table>
-<div class="add">
-  <form method="post" action="/peers/add">
-    <input type="text" name="name" placeholder="e.g. Phone, Laptop" required>
-    <button class="btn" type="submit">Add Peer</button>
+    </tbody>
+  </table>
+
+  <div class="add-wrap">
+    <details>
+      <summary>add peer</summary>
+      <form class="add-form" method="post" action="/peers/add">
+        <div class="add-name">
+          <label>name</label>
+          <input type="text" name="name" placeholder="Phone, Laptop, …" required>
+        </div>
+        <button class="btn btn-accent" type="submit">create →</button>
+        <div class="add-advanced">
+          <div class="field-stack">
+            <label>AllowedIPs <span style="opacity:.5">(optional)</span></label>
+            <input type="text" name="allowed_ips" placeholder="0.0.0.0/0, ::/0">
+            <span class="field-hint">leave blank for full tunnel</span>
+          </div>
+          <div class="field-stack">
+            <label>DNS <span style="opacity:.5">(optional)</span></label>
+            <input type="text" name="dns" placeholder="{{if .DefaultDNS}}{{.DefaultDNS}}{{else}}none{{end}}">
+            <span class="field-hint">leave blank to use server default</span>
+          </div>
+        </div>
+      </form>
+    </details>
+  </div>
+</main>
+
+{{range .Peers}}
+{{if .HasKey}}
+<dialog id="edit-{{.PublicKey}}">
+  <div class="dlg-head">
+    <div class="dlg-title">{{.Name}}</div>
+    <div class="dlg-sub">{{.Address}} · edit client config</div>
+  </div>
+  <form method="post" action="/peers/edit">
+    <input type="hidden" name="key" value="{{.PublicKey}}">
+    <div class="dlg-body">
+      <div class="dlg-field">
+        <label>AllowedIPs</label>
+        <input type="text" name="allowed_ips" value="{{.AllowedIPs}}" placeholder="0.0.0.0/0, ::/0">
+        <div class="dlg-hint">comma-separated CIDRs — leave blank for full tunnel</div>
+      </div>
+      <div class="dlg-field">
+        <label>DNS</label>
+        <input type="text" name="dns" value="{{.DNS}}" placeholder="{{if $.DefaultDNS}}{{$.DefaultDNS}} (server default){{else}}none{{end}}">
+        <div class="dlg-hint">leave blank to use server default</div>
+      </div>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn" onclick="this.closest('dialog').close()">cancel</button>
+      <button type="submit" class="btn btn-accent">save changes</button>
+    </div>
   </form>
-</div>
-<p style="margin-top:32px"><a href="/logout" style="color:#999;font-size:13px">Sign out</a></p>
+</dialog>
+{{end}}
+{{end}}
+
 </body>
 </html>`
 
 const qrHTML = `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{.Name}} — WireGuard Config</title>
+<title>{{.Name}} — wg-admin</title>
 <style>
-*{box-sizing:border-box}
-body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#222}
-h1{margin-bottom:4px}
-.sub{color:#888;margin-bottom:28px;font-size:14px}
-.qr{text-align:center;margin:0 0 24px}
-.qr img{border:1px solid #e5e5e5;padding:12px;border-radius:8px}
-pre{background:#f7f7f7;padding:16px;border-radius:6px;font-size:13px;line-height:1.6;overflow-x:auto;white-space:pre-wrap}
+` + sharedCSS + `
+header{background:var(--card);border-bottom:1px solid var(--border)}
+.hdr{max-width:720px;margin:0 auto;padding:0 24px;height:50px;display:flex;align-items:center;gap:16px}
+.hdr-logo{color:var(--accent);font-size:14px;font-weight:500;letter-spacing:.06em}
+.hdr-gap{flex:1}
+.hdr-back{color:var(--dim);font-size:11px}
+.hdr-back:hover{color:var(--text)}
+main{max-width:720px;margin:0 auto;padding:36px 24px}
+.peer-title{color:var(--bright);font-size:18px;font-weight:500;margin-bottom:6px}
+.peer-sub{color:var(--dim);font-size:12px;margin-bottom:32px}
+.qr-wrap{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:24px;display:inline-block;margin-bottom:28px}
+.qr-wrap img{display:block}
+.config-label{font-size:10px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px}
+pre{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:16px;font-size:12px;line-height:1.7;overflow-x:auto;white-space:pre-wrap;color:var(--text)}
 .actions{display:flex;gap:8px;margin-top:20px}
-.btn{display:inline-block;padding:7px 14px;border:1px solid #ccc;border-radius:4px;background:#fff;font-size:14px;text-decoration:none;color:#222;cursor:pointer}
-.btn:hover{background:#f0f0f0}
 </style>
 </head>
 <body>
-<h1>{{.Name}}</h1>
-<p class="sub">Scan the QR code or download the config file, then import into your WireGuard app.</p>
-<div class="qr">
-  <img src="/peers/qr?key={{.PubKey}}&img=1" width="256" height="256" alt="WireGuard QR code">
-</div>
-<pre>{{.Config}}</pre>
-<div class="actions">
-  <a class="btn" href="/peers/config?key={{.PubKey}}" download>Download .conf</a>
-  <a class="btn" href="/">← Back</a>
-</div>
+<header>
+  <div class="hdr">
+    <span class="hdr-logo">▣ wg-admin</span>
+    <span class="hdr-gap"></span>
+    <a class="hdr-back" href="/">← back</a>
+  </div>
+</header>
+<main>
+  <div class="peer-title">{{.Name}}</div>
+  <div class="peer-sub">Scan the QR code or download the .conf file, then import into your WireGuard app.</div>
+  <div class="qr-wrap">
+    <img src="/peers/qr?key={{.PubKey}}&img=1" width="220" height="220" alt="WireGuard QR code">
+  </div>
+  <div class="config-label">config</div>
+  <pre>{{.Config}}</pre>
+  <div class="actions">
+    <a class="btn btn-accent" href="/peers/config?key={{.PubKey}}" download>↓ download .conf</a>
+    <a class="btn" href="/">done</a>
+  </div>
+</main>
 </body>
 </html>`
