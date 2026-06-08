@@ -3,17 +3,10 @@
 #Address = 10.10.0.1/24
 
 [Interface]
-PrivateKey = <server-private-key>
+PrivateKey = aIB/5HUwCnE5UgAfiO6nA2RlLWv/oKtKJZuMXmC+1lE=
 ListenPort = 51820
 
-# Add one [Peer] block per client.
-# Generate keys with: wg genkey | tee privatekey | wg pubkey > publickey
-
 [Peer]
-# friendly name (optional comment)
-PublicKey = <client-public-key>
+# Android phone
+PublicKey = IfXKQ3tQM9lbNE2RMJfPul1J4e1KyIDYaaxKn8oVzg0=
 AllowedIPs = 10.10.0.2/32
-
-#[Peer]
-#PublicKey = <another-client-public-key>
-#AllowedIPs = 10.10.0.3/32
