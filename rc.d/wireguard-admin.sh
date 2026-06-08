@@ -14,8 +14,9 @@
 # To set a local "admin" password (used when SRM session check is not available):
 #   /volume1/wireguard/bin/wg-admin setpassword
 #
-# Example SRM session-verify URL for RT6600AX (adjust port/path as needed):
-#   http://127.0.0.1:8000/webapi/entry.cgi?api=SYNO.Core.User&method=get&version=1
+# SRM session cookie name: "id" (confirmed on RT6600AX, SRM 1.x).
+# SRM listens on port 8000 (HTTP). Invalid sessions return {"success":false};
+# valid sessions return {"success":true}. Port/path confirmed via API discovery.
 
 INSTALL_DIR=/volume1/wireguard
 BINARY=$INSTALL_DIR/bin/wg-admin
@@ -24,7 +25,7 @@ PIDFILE=/var/run/wireguard-admin.pid
 
 # ── Edit these to match your deployment ──────────────────────────────────────
 ENDPOINT="71.181.45.226:51822"
-SRM_VERIFY_URL=""   # e.g. "http://127.0.0.1:8000/webapi/entry.cgi?api=SYNO.Core.User&method=get&version=1"
+SRM_VERIFY_URL="http://127.0.0.1:8000/webapi/entry.cgi?api=SYNO.Core.User&method=get&version=1"
 ADDR="0.0.0.0:8080"
 DNS="172.16.2.1"
 # ─────────────────────────────────────────────────────────────────────────────
