@@ -178,8 +178,14 @@ again:
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
+			if runtime.GOOS == "linux" && !batchReadWorks {
+				fns = append(fns, s.makeReceiveIPv4Legacy(v4conn))
+			} else {
+				fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
+			}
+		} else {
+			fns = append(fns, s.makeReceiveIPv4(nil, v4conn, false))
 		}
-		fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
@@ -187,8 +193,14 @@ again:
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
+			if runtime.GOOS == "linux" && !batchReadWorks {
+				fns = append(fns, s.makeReceiveIPv6Legacy(v6conn))
+			} else {
+				fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+			}
+		} else {
+			fns = append(fns, s.makeReceiveIPv6(nil, v6conn, false))
 		}
-		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
 		s.ipv6 = v6conn
 	}
 	if len(fns) == 0 {
@@ -238,7 +250,7 @@ func (s *StdNetBind) receiveIP(
 	}
 	defer s.putMessages(msgs)
 	var numMsgs int
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && batchReadWorks {
 		if rxOffload {
 			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
 			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)

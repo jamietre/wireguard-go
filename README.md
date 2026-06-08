@@ -1,3 +1,84 @@
+# WireGuard for Synology RT6600AX (SRM / Linux 4.4.x)
+
+This is a fork of [wireguard-go](https://git.zx2c4.com/wireguard-go) patched to work on
+Synology SRM routers running Linux kernel 4.4.x (tested on the RT6600AX with kernel 4.4.60,
+aarch64 / MT7986A).
+
+## Kernel 4.4.x epoll workaround
+
+**Root cause**: Go's epoll implementation uses `EPOLLET` (edge-triggered mode). On kernel
+4.4.60, `epoll_wait` never delivers `EPOLLIN` events for UDP sockets. `ppoll`/`poll` are
+equally broken for UDP readiness notification on this kernel.
+
+**Fix**: `conn/legacyrecv_linux.go` replaces the standard `makeReceiveIPv4/IPv6` functions
+with a `SetReadDeadline`-based poll loop. Go's timer mechanism is independent of epoll — it
+wakes the goroutine unconditionally after a 10 ms deadline, at which point a non-blocking
+`ReadMsgUDP` drains any packet that arrived since the last wakeup. Maximum added latency per
+packet is 10 ms. The legacy path is selected at startup by `conn/batchread_linux.go` when the
+kernel major version is less than 5.
+
+The standard batched-read path is used on Linux ≥ 5.x and all other platforms.
+
+## Synology SRM notes
+
+- `WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1` is required: SRM kernel 4.4.60 reports
+  native WireGuard support in `/sys/module/wireguard`, but the module is not loaded. Without
+  this env var, wireguard-go refuses to start.
+- The `tun` kernel module may need to be loaded: `insmod /lib/modules/tun.ko`.
+- SRM does not manage NAT for custom subnets — the init script adds a `MASQUERADE` rule for
+  the VPN subnet manually.
+- SRM's `INPUT_FIREWALL` iptables chain controls inbound access. The init script adds a rule
+  for the WireGuard listen port; this can also be added via the SRM Security → Firewall GUI
+  for persistence across SRM updates.
+
+## Deployment
+
+### Prerequisites
+
+- Cross-compile toolchain: `aarch64-linux-gnu-gcc`
+- Go toolchain
+
+### Build
+
+```
+make
+```
+
+This produces `bin/wireguard-go` (aarch64) and `bin/wg`.
+
+### Deploy to router
+
+```
+./deploy.sh [router-ip] [router-user]
+# default: ./deploy.sh 172.16.2.1 jamiet
+```
+
+The script copies binaries, init script, and `restore.sh` to `/volume1/wireguard/` on the
+router. If no config exists yet, it will prompt you to create one from
+`config/wg0.conf.example`.
+
+### Config
+
+Copy `config/wg0.conf.example` to `/volume1/wireguard/wg0.conf` and fill in real keys.
+Generate a key pair with:
+
+```
+wg genkey | tee private.key | wg pubkey
+```
+
+The `#Address = 10.10.0.x/24` comment at the top is parsed by the init script to assign the
+interface address — it is not a standard `wg setconf` field.
+
+### Start / stop
+
+```sh
+sudo /usr/local/etc/rc.d/wireguard.sh start
+sudo /usr/local/etc/rc.d/wireguard.sh stop
+sudo /usr/local/etc/rc.d/wireguard.sh status
+```
+
+---
+
 # Go Implementation of [WireGuard](https://www.wireguard.com/)
 
 This is an implementation of WireGuard in Go.
