@@ -38,10 +38,10 @@ Download the latest release archive from the
 
 ```sh
 # On your local machine — copy to the router
-scp synology-wg-linux-arm64.tar.gz jamiet@172.16.2.1:/tmp/
+scp synology-wg-linux-arm64.tar.gz user@router.lan:/tmp/
 
 # On the router
-ssh jamiet@172.16.2.1
+ssh user@router.lan
 sudo mkdir -p /volume1/wireguard/bin
 cd /tmp && tar xzf synology-wg-linux-arm64.tar.gz -C /volume1/wireguard/bin/
 sudo chmod +x /volume1/wireguard/bin/*
@@ -69,7 +69,7 @@ Produces `bin/wireguard-go`, `bin/wg`, and `bin/wg-admin` (all linux/arm64).
 
 ```sh
 ./deploy.sh [router-ip] [router-user]
-# default: ./deploy.sh 172.16.2.1 jamiet
+# default: ./deploy.sh router.lan user
 ```
 
 Copies binaries and init scripts to `/volume1/wireguard/` and installs them into
@@ -127,12 +127,12 @@ Edit the variables at the top of `rc.d/wireguard-admin.sh` before deploying:
 ```sh
 ENDPOINT="<your-WAN-IP-or-hostname>:51822"   # shown in generated client configs
 ADDR="0.0.0.0:8080"                          # bind address for the web UI
-DNS="172.16.2.1"                             # DNS shown in client configs
+DNS="router.lan"                             # DNS shown in client configs
 ```
 
 ```sh
 sudo /usr/local/etc/rc.d/wireguard-admin.sh start
-# UI available at http://172.16.2.1:8080
+# UI available at http://router.lan:8080
 ```
 
 ## SRM notes
