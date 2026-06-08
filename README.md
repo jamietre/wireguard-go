@@ -37,8 +37,8 @@ Download the latest release archive from the
 [Releases page](https://github.com/jamietre/wireguard-go/releases):
 
 ```sh
-# On your local machine — copy to the router
-scp synology-wg-linux-arm64.tar.gz user@router.lan:/tmp/
+# On your local machine — copy to the router (SRM uses internal-sftp; scp won't work)
+sftp user@router.lan <<< "put synology-wg-linux-arm64.tar.gz /tmp/"
 
 # On the router
 ssh user@router.lan
