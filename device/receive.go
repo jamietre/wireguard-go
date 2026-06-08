@@ -507,6 +507,11 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
+			if !peer.allowedByFilter(elem.packet) {
+				device.log.Verbosef("Packet from %v dropped by destination filter", peer)
+				continue
+			}
+
 			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
 		}
 
