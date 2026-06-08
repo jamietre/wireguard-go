@@ -1,1 +1,7 @@
-wireguard-go
+# upstream source trees (submodules kept separately if needed)
+wireguard-tools/
+wireguard-go-aarch64
+
+# build artifacts we don't want to track
+*.o
+*.a

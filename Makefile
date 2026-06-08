@@ -1,31 +1,19 @@
-PREFIX ?= /usr
-DESTDIR ?=
-BINDIR ?= $(PREFIX)/bin
-export GO111MODULE := on
+CROSS_CC  = aarch64-linux-gnu-gcc
+GOOS      = linux
+GOARCH    = arm64
+CGO       = 0
 
-all: generate-version-and-build
+.PHONY: all wireguard-go wg clean
 
-MAKEFLAGS += --no-print-directory
+all: bin/wireguard-go bin/wg
 
-generate-version-and-build:
-	@export GIT_CEILING_DIRECTORIES="$(realpath $(CURDIR)/..)" && \
-	tag="$$(git describe --dirty 2>/dev/null)" && \
-	ver="$$(printf 'package main\n\nconst Version = "%s"\n' "$$tag")" && \
-	[ "$$(cat version.go 2>/dev/null)" != "$$ver" ] && \
-	echo "$$ver" > version.go && \
-	git update-index --assume-unchanged version.go || true
-	@$(MAKE) wireguard-go
+bin/wireguard-go:
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO) go build -o $@ .
 
-wireguard-go: $(wildcard *.go) $(wildcard */*.go)
-	go build -v -o "$@"
-
-install: wireguard-go
-	@install -v -d "$(DESTDIR)$(BINDIR)" && install -v -m 0755 "$<" "$(DESTDIR)$(BINDIR)/wireguard-go"
-
-test:
-	go test ./...
+bin/wg:
+	$(MAKE) -C wireguard-tools/src CC=$(CROSS_CC) WITH_WGQUICK=no LDFLAGS="-static"
+	cp wireguard-tools/src/wg $@
 
 clean:
-	rm -f wireguard-go
-
-.PHONY: all clean test install generate-version-and-build
+	rm -f bin/wireguard-go bin/wg
+	$(MAKE) -C wireguard-tools/src clean
