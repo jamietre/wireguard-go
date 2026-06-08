@@ -95,7 +95,6 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/debug/auth", app.handleDebugAuth)
 	mux.HandleFunc("/login", app.handleLogin)
 	mux.HandleFunc("/logout", app.handleLogout)
 	mux.HandleFunc("/peers/qr", app.require(app.handleQR))
@@ -455,25 +454,6 @@ Endpoint = %s
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 `, p.PrivateKey, p.Address, app.dns, app.serverPublicKey(), app.endpoint)
-}
-
-func (app *App) handleDebugAuth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintln(w, "=== Cookies received ===")
-	for _, c := range r.Cookies() {
-		fmt.Fprintf(w, "  %s = %s...\n", c.Name, c.Value[:min(len(c.Value), 8)])
-	}
-	fmt.Fprintln(w, "\n=== SRM session file check ===")
-	fmt.Fprintf(w, "  file: %s\n", app.srmSessions)
-	fmt.Fprintf(w, "  result: %v\n", app.verifySRM(r))
-	fmt.Fprintf(w, "\n=== Overall auth ===\n  %v\n", app.checkAuth(r))
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func safeNext(next string) string {

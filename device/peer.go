@@ -56,6 +56,8 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+
+	peerFilterExt // build-tag-optional per-peer destination filter (wg_peer_filter)
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {

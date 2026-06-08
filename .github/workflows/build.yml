@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    name: Build binaries (linux/arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build wireguard-go
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/wireguard-go .
+
+      - name: Build wg-admin
+        run: |
+          cd admin
+          go mod tidy
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../bin/wg-admin .
+
+      - name: Build wg (wireguard-tools)
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          make -C wireguard-tools/src \
+            CC=aarch64-linux-gnu-gcc \
+            WITH_WGQUICK=no \
+            LDFLAGS="-static"
+          cp wireguard-tools/src/wg bin/wg
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: synology-wg-linux-arm64
+          path: bin/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: synology-wg-linux-arm64
+          path: bin/
+
+      - name: Create release archive
+        run: |
+          chmod +x bin/*
+          tar -czf synology-wg-linux-arm64.tar.gz -C bin .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: synology-wg-linux-arm64.tar.gz
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download `synology-wg-linux-arm64.tar.gz` and extract to `/volume1/wireguard/bin/` on your Synology router.
+
+            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
