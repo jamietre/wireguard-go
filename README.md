@@ -34,7 +34,7 @@ A single-binary Go web server in `admin/`. Features:
 ## Installation (pre-built binaries)
 
 Download the latest release archive from the
-[Releases page](https://github.com/jamietre/wireguard-go-synology/releases):
+[Releases page](https://github.com/jamietre/wireguard-go/releases):
 
 ```sh
 # On your local machine — copy to the router
@@ -58,8 +58,8 @@ Then follow the [Configuration](#configuration) and [Init scripts](#init-scripts
 - Git (for submodules)
 
 ```sh
-git clone --recurse-submodules https://github.com/jamietre/wireguard-go-synology.git
-cd wireguard-go-synology
+git clone --recurse-submodules https://github.com/jamietre/wireguard-go.git
+cd wireguard-go
 make
 ```
 
